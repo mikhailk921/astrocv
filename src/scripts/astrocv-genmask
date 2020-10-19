@@ -1,0 +1,197 @@
+#!/usr/bin/python3
+
+import sys
+import os
+import time
+import argparse
+import traceback
+import logging
+
+import numpy as np
+from astrocv.processing import getGradientMask, getNoiseMask, getUnionMask, integralFrom
+
+import astrocv
+
+
+#TODO:
+#   - read "correct answers" (from simsky), compare them and calculated total "score"
+#   - implement colored pixel formats (rgba, rgb0)
+
+
+
+parser = argparse.ArgumentParser(prog=sys.argv[0],
+                                 description='Process frames in rawvideo format')
+
+parser.add_argument('-f', '--pixel-format', type=str, dest='pixel_format',
+                    default='gray', choices=['gray', 'gray16le', 'gray32le', 'rgba', 'rgb0'],
+                    help='Pixel format of simulated video (default %(default)s)')
+parser.add_argument('-s', '--frame-size', type=str, dest='frame_size', default='768x768',
+                    help='Frame size of simulated video in form <WIDTH>x<HEIGHT> '
+                    '(default %(default)s)')
+parser.add_argument('-i', '--input', type=str, dest='input', default='-',
+                    help='Source for stream (video/picture file or directory). '
+                    'default - raw binary from stdin, like -f rawvideo of ffmpeg.')
+parser.add_argument('-l', '--length', type=int, dest='length', default=100,
+                    help='Sequence length of generate frames (default - infinite)')
+
+#parser.add_argument('-o', '--output', type=str, dest='output', default=None,
+#                    help='Output file for rawvideo (default stdout)')
+parser.add_argument('--image', type=str, dest='image', default=None,
+                    help='File name to output "image mask"')
+
+args = parser.parse_args()
+
+bytes_pp, dtype = {
+    'gray': (1, np.uint8),
+    'gray16le': (2, np.uint16),
+    'gray32le': (4, np.int32),
+    'rgba': (3, np.int32),
+    'rgb0': (4, np.int32)
+}[args.pixel_format]
+bits_pp = bytes_pp * 8
+white_level = (1 << bits_pp)
+
+
+def makeMask(series):
+    gradMask = getGradientMask(series)
+    intMask = getNoiseMask(series)
+    unionMask = np.minimum(gradMask, intMask)
+    intmask = integralFrom(unionMask)
+
+    return unionMask, intmask
+
+
+class RawBinaryCap(object):
+    def __init__(self, fobj, pixel_format, video_size):
+        self.fobj = fobj
+        self.bpp, self.converter = {
+            'gray': (1, self._conv_gray),
+            'gray16le': (2, self._conv_gray16le),
+            'gray32le': (4, self._conv_gray32le),
+            'rgba': (3, self._conv_rgba),
+            'rgb0': (4, self._conv_rgb0)
+        }[pixel_format]
+        self.w, self.h = map(int, video_size.split('x'))
+        self.frame_size = self.bpp * self.w * self.h
+
+    def read(self):
+        try:
+            pixels = self.fobj.read(self.frame_size)
+            return True, self.converter(pixels, self.h, self.w)
+        except:
+            return False, None
+
+    @staticmethod
+    def _conv_gray(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint8), (h, w))
+
+    @staticmethod
+    def _conv_gray16le(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint16), (h, w))
+
+    @staticmethod
+    def _conv_gray32le(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.int32), (h, w))
+
+    @staticmethod
+    def _conv_rgba(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint8), (h, w, 4))
+
+    @staticmethod
+    def _conv_rgb0(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint8), (h, w, 3))
+
+
+try:
+    import cv2
+    import numpy as np
+    import astrocv.processing as processing
+
+#input
+    if args.pixel_format is not None and args.frame_size is not None:
+        if args.input == '-':
+            cap = RawBinaryCap(sys.stdin, args.pixel_format, args.frame_size)
+        else:
+            fin = open(args.input, 'rb')
+            cap = RawBinaryCap(fin, args.pixel_format, args.frame_size)
+    else:
+        try:
+            src = int(args.input)
+        except:
+            src = args.input
+        cap = cv2.VideoCapture(src)
+        print("stream initialized as {} cv2 resource name".format(src))
+     
+except Exception as ex:
+    raise
+
+try:
+    series = []
+
+    while args.length is None or len(series) < args.length:
+
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame.ndim == 3:
+            colors = [frame[:, :, i] for i in range(frame.shape[-1])]
+        else:
+            colors = [frame]
+
+        print("Generated frames: {}".format(len(series)))
+        series.append(colors)
+
+    if len(series) < 1:
+        print("Error, len(series)=: {}".format(len(series)))
+        exit(-1)
+
+    masks = []
+    for j in range(len(series[0])):
+        tmp = []
+        for i in series:
+            tmp.append(i[j])
+        mask, integralMask = makeMask(tmp)
+        masks.append(mask)
+
+    RGBA = ('R','G','B','A')
+    RGB = ('R', 'G', 'B')
+
+    # output
+    try:
+        time = time.localtime()
+        timeStr = str(time.tm_year) + "." + str(time.tm_mon) + "." + str(time.tm_mday) + "." + \
+                  str(time.tm_hour) + "." + str(time.tm_min) + "." + str(time.tm_sec)
+        name = []
+        if len(masks) == 1:
+            name.append("mask_" + timeStr)
+        elif len(masks) == 3:
+            for i in RGB:
+                name.append("mask_" + i + "_" + timeStr)
+        elif len(masks) == 4:
+            for i in RGBA:
+                name.append("mask_" + i + "_" + timeStr)
+
+
+        for i in range(len(name)):
+            fout = open(name[i] + ".bin", 'wb')
+            fname = name[i] + ".jpg" if args.image is None else args.image
+            fout.write(masks[i].data)
+
+            masks[i] *= white_level - 1
+            cv2.imwrite(fname, masks[i])
+
+            fout.close()
+
+        exit(0)
+
+    except Exception as ex:
+        raise
+
+
+except Exception:
+    sys.stderr.write(traceback.format_exc())
+except KeyboardInterrupt:
+    pass
+
+
+

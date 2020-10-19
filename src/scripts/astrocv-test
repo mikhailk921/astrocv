@@ -1,0 +1,227 @@
+#!/usr/bin/python
+
+import sys
+import os
+import time
+import argparse
+import traceback
+import logging
+import random
+
+import numpy as np
+
+import astrocv
+import astrocv.processing
+
+from astrocv.ganerate import addNoiseUniform, addNoiseNorm, drawObject, addMarker
+from astrocv.processing import add, sub, difference, smooth, contrast, calibrationFrom, \
+     applyCalibration, imageInfo, upsample, downsample, resample, blur, locmax
+from astrocv.search import searchObjects, searchObjectsForMultiROI
+
+
+BPP_LIST = [8, 16, 32]
+SIZE_LIST = ['512x512', '1024x1024', '2048x2048']
+FUNC_LIST = ['*',
+     'addNoiseUniform', 'addNoiseNorm', 'drawObject', 'addMarker', 
+     'add', 'sub', 'difference', 'smooth', 'contrast', 'calibrationFrom',
+     'applyCalibration', 'imageInfo', 'upsample', 'downsample', 'resample',
+     'blur', 'locmax', 'searchObjects', 'searchObjectsForMultiROI',
+     # add zernike functions
+]
+
+
+
+parser = argparse.ArgumentParser(prog=sys.argv[0],
+                                 description='Test performance of AstroCV functions')
+
+parser.add_argument('--bpp', type=int, dest='bpp', nargs='*',
+                    default=[8], choices=BPP_LIST,
+                    help='Bits per pixel (default %(default)s)')
+parser.add_argument('--size', type=str, dest='size', nargs='*',
+                    default=['1024x1024'],
+                    help='Frame size in form <WIDTH>x<HEIGHT> (default %(default)s)')
+parser.add_argument('--output-frames', dest='output_frames', action='store_true',
+                    help='If specified, simulated frames will be outputted in raw format to file')
+
+parser.add_argument('-f', '--function', type=str, dest='function', nargs='*',
+                    default=['*'], choices=FUNC_LIST,
+                    help='Function name for testing (default - all functions)')
+
+parser.add_argument('--mean', type=int, dest='mean', default=100,
+                    help='Mean brightness level in random frames (default %(default)s)')
+parser.add_argument('--noise', type=int, dest='noise', default=10,
+                    help='Noise level in random frames (default %(default)s)')
+parser.add_argument('--objects-count', type=int, dest='objects_count', default=5,
+                    help='Number of simulated objects (default %(default)s)')
+parser.add_argument('--object-size', type=int, dest='object_size', default=10,
+                    help='Diameter of simulated objects (default %(default)s)')
+parser.add_argument('--object-brightness', type=int, dest='object_brightness', default=50,
+                    help='Brightness of simulated objects (default %(default)s)')
+
+parser.add_argument('--up-scale', type=int, dest='up_scale', default=16,
+                    help='Scale parameter for upsampling (default %(default)s)')
+parser.add_argument('--down-scale', type=int, dest='down_scale', default=16,
+                    help='Scale parameter for downsampling (default %(default)s)')
+
+parser.add_argument('--method', type=str, dest='method', default='contrast',
+                    choices=['integral', 'contrast'],
+                    help='Search method (default %(default)s)')
+parser.add_argument('--min-certainty', type=float, dest='min_certainty', default=0.0,
+                    help='MinCertainty search parameter (default %(default)s)')
+
+parser.add_argument('--roi-size', type=int, dest='roi_size', default=30,
+                    help='Size of (square) ROI for searchMultiROI (default %(default)s)')
+
+parser.add_argument('--min-count', type=int, dest='min_count', default=1,
+                    help='Minimum number of repetitions (default %(default)s)')
+parser.add_argument('--max-count', type=int, dest='max_count', default=10000,
+                    help='Maximum number of repetitions (default %(default)s)')
+parser.add_argument('--min-time', type=float, dest='min_time', default=0.1,
+                    help='Minimum time duration of repetitions (default %(default)s)')
+parser.add_argument('--max-time', type=float, dest='max_time', default=1.0,
+                    help='Maximum time duration of repetitions (default %(default)s)')
+
+parser.add_argument('--prefer-cv2', type=str, dest='prefer_cv2', nargs='*',
+                    choices=['upsample', 'downsample', 'convolve'], default=[],
+                    help='Type of functions to prefer OpenCV implementation (if available)')
+
+parser.add_argument('--threads', type=int, dest='threads', default=None,
+                    help='OMP threads to use (Default - maximum)');
+
+args = parser.parse_args()
+
+
+logging.root.setLevel(logging.DEBUG)
+logging.root.addHandler(logging.StreamHandler())
+
+METHOD = {'integral': astrocv.search.METHOD_BEST_INTEGRAL,
+          'contrast': astrocv.search.METHOD_BEST_CONTRAST}[args.method]
+
+
+if args.threads is None:
+     nthreads = astrocv.set_threads_count(astrocv.max_threads_count())
+else:
+     nthreads = astrocv.set_threads_count(args.threads)
+print("Use {} thread(s)".format(nthreads))
+
+
+for func in args.prefer_cv2:
+     if func == 'upsample':
+          astrocv.processing.PREFER_CV2_UPSAMPLE = True
+     elif func == 'downsample':
+          astrocv.processing.PREFER_CV2_DOWNSAMPLE = True
+     elif func == 'convolve':
+          astrocv.processing.PREFER_CV2_CONVOLVE = True
+
+
+if '*' in args.function:
+     args.function = FUNC_LIST[:]
+     args.function.remove('*')
+
+
+def test_addNoiseUniform(im, roi):
+     addNoiseUniform(im, 50, 10)
+def test_addNoiseNorm(im, roi):
+     addNoiseNorm(im, 50, 10)
+def test_drawObject(im, roi):
+     x, y = len(im)//2, len(im[0])//2
+     drawObject(im, x, y, args.object_size)
+def test_addMarker(im, roi):
+     x, y = len(im)//2, len(im[0])//2
+     r = args.object_size // 2
+     addMarker(im, x, y, x-r, y-r, x+r, y+r)
+def test_add(im, roi):
+     add(im, im)
+def test_sub(im, roi):
+     sub(im, im)
+def test_difference(im, roi):
+     difference(im, im)
+def test_smooth(im, roi):
+     max_size = args.object_size * 2
+     smooth(im, max_size)
+def test_contrast(im, roi):
+     min_size = args.object_size // 2
+     max_size = args.object_size * 2
+     contrast(im, min_size, max_size)
+def test_calibrationFrom(im, roi):
+     calibrationFrom(im, 10)
+def test_applyCalibration(im, roi):
+     applyCalibration(im, im)
+def test_imageInfo(im, roi):
+     imageInfo(im)
+def test_upsample(im, roi):
+     upsample(im, args.up_scale)
+def test_downsample(im, roi):
+     downsample(im, args.down_scale)
+def test_resample(im, roi):
+     resample(im, args.up_scale, args.down_scale);
+def test_blur(im, roi):
+     blur(im, args.object_size)
+def test_locmax(im, roi):
+     locmax(im, args.object_size)
+def test_searchObjects(im, roi):
+     min_size = args.object_size // 2
+     max_size = args.object_size * 2
+     max_objects = args.objects_count * 2
+     searchObjects(im, im, METHOD, min_size, max_size, args.min_certainty,
+          max_objects)
+def test_searchObjectsForMultiROI(im, roi):
+     roi_cnt = len(roi) // 4
+     roi = np.array(roi, dtype=np.uint32)
+     min_size = args.object_size // 2
+     max_size = args.object_size * 2
+     searchObjectsForMultiROI(roi_cnt, roi, im, im, METHOD, min_size, 
+          max_size, args.min_certainty)
+
+
+def test_func(func, im, roi, min_count, max_count, min_time, max_time):
+     cnt = 0
+     im_copy = im[:,:]
+     t0 = time.time()
+     while cnt < max_count:
+          f = globals()['test_{}'.format(func)]
+          f(im_copy, roi)
+          cnt += 1
+          dt = time.time() - t0
+          if dt >= max_time:
+               break
+     freq = float(cnt) / dt
+     one_run = dt / float(cnt)
+     return dt, cnt, freq, one_run
+
+
+IMAGES = {}
+SIZES = []
+
+print("Creating images...")
+for bpp in args.bpp:
+     t = {8: np.uint8, 16: np.uint16, 32: np.uint32}[bpp]
+     for size in args.size:
+          width, height = [int(x) for x in size.split('x')]
+          s = (bpp, width, height)
+          SIZES.append(s)
+          im = np.zeros((height, width), dtype=t)
+          addNoiseNorm(im, args.mean, args.noise)
+          d = args.object_size
+          for _ in range(args.objects_count):
+               x = random.randint(d, width-d)
+               y = random.randint(d, height-d)
+               drawObject(im, x, y, d, args.object_brightness)
+          if args.output_frames:
+               with open('./{}x{}_{}b.raw'.format(width, height, bpp), 'wb') as fout:
+                    fout.write(bytearray(im.data))
+          roi = []
+          for y in range(0, height - args.roi_size, args.roi_size):
+               for x in range(0, width - args.roi_size, args.roi_size):
+                    roi.extend([x, y, args.roi_size, args.roi_size])
+          IMAGES[s] = im, roi
+print("Done")
+
+for func in args.function:
+     for size in SIZES:
+          bpp, width, height = size
+          im, roi = IMAGES[size]
+          dt, cnt, freq, one_run = test_func(func, im, roi, \
+               args.min_count, args.max_count, args.min_time, args.max_time)
+          print("{}_{}b ({}x{}): {} run(s) in {:.3f} sec, freq = {:.3f} hz, per run = {:.3f} ms".format(
+                func, bpp, width, height, cnt, dt, freq, one_run*1e3))

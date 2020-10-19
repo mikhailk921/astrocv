@@ -1,0 +1,293 @@
+#!/usr/bin/python
+
+import sys
+import os
+import time
+import argparse
+import traceback
+import random
+import logging
+
+import numpy as np
+import numpy.linalg as la
+import numpy.polynomial.polynomial as poly
+
+import astrocv
+
+#TODO:
+#   - implement colored pixel formats (rgba, rgb0)
+
+
+parser = argparse.ArgumentParser(prog=sys.argv[0],
+                                 description='Simulate and stream frames in rawvideo format')
+
+parser.add_argument('-f', '--pixel-format', type=str, dest='pixel_format',
+                    default='gray', choices=['gray', 'gray16le'],
+                    help='Pixel format of simulated video (default %(default)s)')
+parser.add_argument('-s', '--frame-size', type=str, dest='frame_size', default='768x768',
+                    help='Frame size of simulated video in form <WIDTH>x<HEIGHT> '
+                    '(default %(default)s)')
+parser.add_argument('-e', '--exposure', type=float, dest='exposure', default=0.05,
+                    help='Simulated exposure of each frame in seconds (default %(default)s)')
+parser.add_argument('-d', '--delay', type=float, dest='delay', default=None,
+                    help='Delay between frames in seconds (default same as exposure)')
+parser.add_argument('-l', '--length', type=int, dest='length', default=None,
+                    help='Sequence length of simulated frames (default - infinite)')
+
+parser.add_argument('-o', '--output', type=str, dest='output', default=None,
+                    help='Output file for rawvideo (default stdout)')
+parser.add_argument('-c', '--correct', type=str, dest='correct', default=None,
+                    help='File name to output "correct answers", i.e. instant values '
+                    'used for generating each frame')
+
+parser.add_argument('--seed', type=int, dest='seed', default=None,
+                    help='Seed for initializing pseudo-random generator')
+
+parser.add_argument('--mean', type=float, dest='mean', default=0.5,
+                    help='Background mean value, 0.0..1.0 (default %(default)s)')
+parser.add_argument('--non-uniformity', type=float, dest='non_uniformity', default=0.3,
+                    help='Slight deviation of background from mean value, '
+                    'like in vignetting effect, 0.0..1.0 (default %(default)s)')
+parser.add_argument('--bgd-blink', type=float, dest='bgd_blink', default=0.1,
+                    help='Speed of background change [br/sec] (default %(default)s)')
+
+parser.add_argument('--noise', type=float, dest='noise', default=0.02,
+                    help='Random noise (one-sigma of normal distribution), 0.0..1.0 (default %(default)s)')
+
+parser.add_argument('--count', type=int, dest='count', default=5,
+                    help='Number of simulated objects')
+parser.add_argument('--size', type=str, dest='size', default='7:20',
+                    help='Size range of single object [px] (default %(default)s)')
+parser.add_argument('--brightness', type=str, dest='brightness', default='0.03:0.15',
+                    help='Brightness range of single object, 0.0..1.0 (default %(default)s)')
+parser.add_argument('--blink', type=str, dest='blink', default='-0.01:0.01',
+                    help='Range of brightness change speed [br/sec] (default %(default)s)')
+parser.add_argument('--velocity', type=str, dest='velocity', default='-50:50',
+                    help='Velocity range of single object [px/sec] (default %(default)s)')
+parser.add_argument('--acceleration', type=str, dest='acceleration', default='-20:20',
+                    help='Acceleration range of single object [px/sec^2] (default %(default)s)')
+
+parser.add_argument('--threads', type=int, dest='threads', default=None,
+                    help='OMP threads to use (Default - maximum)')
+
+args = parser.parse_args()
+
+
+if args.threads is None:
+     nthreads = astrocv.set_threads_count(astrocv.max_threads_count())
+else:
+     nthreads = astrocv.set_threads_count(args.threads)
+logging.info("Use %d thread(s)", nthreads)
+
+
+if args.seed is None:
+    random.seed()
+else:
+    random.seed(args.seed)
+    #TODO: init seed in astrocv?
+
+
+def parse_range(s):
+    s_min, s_max = [float(x) for x in s.split(':')]
+    return s_min, s_max
+
+
+bytes_pp, dtype = {
+    'gray': (1, np.uint8),
+    'gray16le': (2, np.uint16)
+}[args.pixel_format]
+bits_pp = bytes_pp * 8
+white_level = (1 << bits_pp)
+width, height = map(int, args.frame_size.split('x'))
+
+mean = int(white_level * args.mean)
+noise = int(white_level * args.noise)
+
+if args.non_uniformity > 0:
+    xs = np.asarray([-1,  width//3, 2* width//3,  width]) + 0.0
+    ys = np.asarray([-1, height//3, 2*height//3, height]) + 0.0
+    xx = np.asarray([x/width for x in xs for y in ys]) + 0.0
+    yy = np.asarray([y/height for x in xs for y in ys]) + 0.0
+    vs = []
+    for x in xs:
+        for y in ys:
+            r = np.sqrt(x**2 + y**2) / np.sqrt(width**2 + height**2)
+            offset = -r * args.non_uniformity
+            vs.append(random.uniform(0.0, args.non_uniformity) + offset)
+    vs = np.asarray(vs) + 0.0
+    V = poly.polyvander2d(xx, yy, [2, 2])
+    lhs = V.T
+    rhs = vs.T
+    rcond = len(vs)*np.finfo(vs.dtype).eps
+    scl = np.sqrt(np.square(lhs).sum(1))
+    c, resids, rank, s = la.lstsq(lhs.T/scl, rhs.T, rcond)
+    c = (c.T/scl).T.reshape((3, 3))
+    non_uniform = np.asarray([[poly.polyval2d(float(x)/width, float(y)/height, c)
+        for x in range(width)] for y in range(height)])
+else:
+    non_uniform = np.zeros((height, width), float)
+
+bgd_bright, bgd_t, blink_speed = 0.0, 0.0, args.bgd_blink
+
+min_size, max_size = parse_range(args.size)
+min_brightness, max_brightness = parse_range(args.brightness)
+min_blink, max_blink = parse_range(args.blink)
+min_velocity, max_velocity = parse_range(args.velocity)
+min_acceleration, max_acceleration = parse_range(args.acceleration)
+objects = []
+for _ in range(args.count):
+    objects.append({
+        "size": random.uniform(min_size, max_size),
+        "brightness": random.uniform(min_brightness, max_brightness),
+        "blink": random.uniform(min_blink, max_blink),
+        "velocity_x": random.uniform(min_velocity, max_velocity),
+        "velocity_y": random.uniform(min_velocity, max_velocity),
+        "acceleration_x": random.uniform(min_acceleration, max_acceleration),
+        "acceleration_y": random.uniform(min_acceleration, max_acceleration),
+        
+        "x": random.uniform(0, width),
+        "y": random.uniform(0, height),
+        "t": 0.0
+    })
+
+
+def background(t):
+    global bgd_bright, bgd_t, blink_speed, args, non_uniform, mean, white_level
+    dt = t - bgd_t
+    bgd_bright += dt * blink_speed
+    if bgd_bright > 1.0:
+        blink_speed = -args.bgd_blink
+    elif bgd_bright < -1.0:
+        blink_speed = +args.bgd_blink
+    bgd_t = t
+    bgd = (non_uniform * bgd_bright * white_level).astype(dtype) + mean
+    return bgd
+
+
+def add_noise(bgd, t):
+    global noise
+    astrocv.addNoiseNorm(bgd, 0, noise)
+    return bgd
+
+
+def add_objects(bgd, t):
+    global objects
+    for obj in objects:
+        dt = t - obj["t"]
+        obj["t"] = t
+        obj["velocity_x"] += obj["acceleration_x"] * dt
+        obj["velocity_y"] += obj["acceleration_y"] * dt
+        obj["x"] += obj["velocity_x"] * dt
+        obj["y"] += obj["velocity_y"] * dt
+        obj["brightness"] += obj["blink"] * dt
+        
+        if obj["x"] < 0:
+            obj["acceleration_x"] = +abs(obj["acceleration_x"])
+        elif obj["x"] > width:
+            obj["acceleration_x"] = -abs(obj["acceleration_x"])
+        elif obj["velocity_x"] > max_velocity:
+            obj["acceleration_x"] = -abs(obj["acceleration_x"])
+        elif obj["velocity_x"] < min_velocity:
+            obj["acceleration_x"] = +abs(obj["acceleration_x"])
+        
+        if obj["y"] < 0:
+            obj["acceleration_y"] = +abs(obj["acceleration_y"])
+        elif obj["y"] > height:
+            obj["acceleration_y"] = -abs(obj["acceleration_y"])
+        elif obj["velocity_y"] > max_velocity:
+            obj["acceleration_y"] = -abs(obj["acceleration_y"])
+        elif obj["velocity_y"] < min_velocity:
+            obj["acceleration_y"] = +abs(obj["acceleration_y"])
+        
+        if obj["brightness"] > max_brightness:
+            obj["blink"] = -abs(obj["blink"])
+        elif obj["brightness"] < min_brightness:
+            obj["blink"] = +abs(obj["blink"])
+        astrocv.drawObject(bgd, int(obj["x"]), int(obj["y"]),
+            int(obj["size"]), Signal=int(obj["brightness"]*white_level))
+    return bgd
+
+
+def next_frame(t):
+    im = background(t)
+    add_noise(im, t)
+    add_objects(im, t)
+    return im
+
+
+def format_correct(nframe, t):
+    global objects, white_level
+    obj_to_output = []
+    for obj in objects:
+        if obj["x"] < 0 or obj["x"] > width:
+            continue
+        if obj["y"] < 0 or obj["y"] > height:
+            continue
+        obj_to_output.append(obj)
+    vals = [
+        "{:d}".format(nframe), 
+        "{:.3f}".format(t),
+        "{:d}".format(len(obj_to_output))
+    ]
+    for obj in obj_to_output:
+        vals.append("{:.2f}".format(obj["size"]))
+        vals.append("{:.3f}".format(obj["brightness"] * white_level))
+        vals.append("{:.2f}".format(obj["x"]))
+        vals.append("{:.2f}".format(obj["y"]))
+        vals.append("{:.3f}".format(obj["velocity_x"]))
+        vals.append("{:.3f}".format(obj["velocity_y"]))
+        vals.append("{:.4f}".format(obj["acceleration_x"]))
+        vals.append("{:.4f}".format(obj["acceleration_y"]))
+    return "\t".join(vals)
+
+
+if args.output is None:
+    try:
+        fout = sys.stdout.buffer
+    except:
+        fout = os.fdopen(sys.stdout.fileno(), 'wb')
+else:
+    fout = open(args.output, 'wb')
+
+if args.correct is None:
+    fcorrect = None
+else:
+    fcorrect = open(args.correct, 'w')
+    fcorrect.write("#n_frame\ttime\tn_objects\tsize[i]\tsignal[i]\tX[i]\tY[i]\tVX[i]\tVY[i]\tAX[i]\tAY[i]\n")
+
+
+if args.delay is None:
+    delay = args.exposure
+else:
+    delay = args.delay
+try:
+    t0 = time.time()
+    n_frame = 0
+    while args.length is None or n_frame < args.length:
+        t1 = time.time()
+        
+        if args.output is not None:
+            print("Generated frames: {}".format(n_frame))
+        t_frame = n_frame * args.exposure
+        frame = next_frame(t_frame)
+        fout.write(frame.data)
+        if fcorrect is not None:
+            fcorrect.write(format_correct(n_frame, t_frame))
+            fcorrect.write("\n")
+        
+        elapsed = time.time() - t1
+        rest = delay - elapsed
+        if rest > 0:
+            time.sleep(rest)
+        n_frame += 1
+        
+except Exception:
+    sys.stderr.write(traceback.format_exc())
+except KeyboardInterrupt:
+    pass
+
+if fcorrect is not None:
+    fcorrect.close()
+
+if args.output is not None:
+    fout.close()

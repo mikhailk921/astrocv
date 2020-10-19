@@ -1,0 +1,719 @@
+#!/usr/bin/python
+
+import sys
+import os
+import time
+import argparse
+import traceback
+import logging
+
+import numpy as np
+
+import astrocv
+
+
+#TODO:
+#   - read "correct answers" (from simsky), compare them and calculated total "score"
+#   - implement colored pixel formats (rgba, rgb0)
+
+
+"""
+Example
+
+./process --comment "{date} {time}.{usecs:06d}, frame #{n_frame} {width}x{height} {pixtype}" \
+                    "FPS: {fps:.1f}, levels: {avg} +- {std}, min: {min}, max: {max}" \
+                    "{detect}: {sdetected}" \
+         --comment-position top \
+         --detect sv:CONTRAST --detect-params NMaxObjects=10 minSize=5 maxSize=15 minCertainty=4.0 \
+         --detect-max 10 --detect-marker ellipse \
+         --draw-frames --min-redraw-delay 0.08 \
+         --output-stream stream.avi --stream-codec XVID --stream-fps 15 --min-output-delay 0.0667 \
+         --output-frames "frames/{n_frame}.tif" \
+         --output-comment-file "frames/{date}.log" \
+         --output-comment "{n_frame} {time} {usecs:06d} {avg} {detected}" \
+         -i ./seed.1.frames
+
+"""
+
+parser = argparse.ArgumentParser(prog=sys.argv[0],
+                                 description='Process frames in rawvideo format')
+
+parser.add_argument('-f', '--pixel-format', type=str, dest='pixel_format',
+                    default='gray', choices=['gray', 'gray16le'],
+                    help='Pixel format of simulated video (default %(default)s)')
+parser.add_argument('-s', '--frame-size', type=str, dest='frame_size', default=None,
+                    help='Frame size of simulated video in form <WIDTH>x<HEIGHT> '
+                    '(default %(default)s)')
+parser.add_argument('-i', '--input', type=str, dest='input', default='-',
+                    help='Source for stream (video/picture file or directory). '
+                    'default - raw binary from stdin, like -f rawvideo of ffmpeg.')
+
+parser.add_argument('--mask', type=str, dest='mask', default='-',
+                    help='Source mask file (raw binary file). '
+                    'default - no mask')
+
+parser.add_argument('-d', '--delay', type=float, dest='delay', default=0.05,
+                    help='Pause after each processed frame in seconds (default %(default)s)')
+
+parser.add_argument('--comment', type=str, dest='comment', nargs='*',
+                    default=[], help='Line(s) to put on frame, available macroses are: '
+                    'date, time, timestamp, usecs, n_frame, width, height, pixtype, fps, '
+                    'min, max, avg, std, '
+                    'processing, detect, detected, sdetected')
+parser.add_argument('--comment-position', type=str, dest='comment_position',
+                    choices=['top', 'bottom'], default='top',
+                    help='Position of comment line(s) (default %(default)s)')
+
+parser.add_argument('--processing', type=str, dest='processing', nargs='*',
+                    default=[], choices=['smooth', 'contrast', 'negative',
+                    'equalize', 'sub_blue', 'sub_bgd', 'grayscale', 'blur',
+                    'locmax', 'difference'],
+                    help='Action(s) of processing, acting on each frame')
+parser.add_argument('--processing-params', type=str, dest='processing_params', nargs='*',
+                    default=[], help='Parameters for processing frames in the form '
+                    'PARAM=VALUE. Known parameters (default): kernel (5).')
+parser.add_argument('--detect', type=str, dest='detect',
+                    default=None, choices=['cv:FAST', 'cv:STAR', 'cv:SIFT', 'cv:SURF', 
+                    'cv:ORB', 'cv:BRISK', 'cv:MSER', 'cv:GFTT', 'cv:HARRIS', 'cv:Dense',
+                    'cv:SimpleBlob', 'sv:INTEGRAL', 'sv:CONTRAST'], 
+                    help='Feature detector type (as named in OpenCV or AstroCV)')
+parser.add_argument('--detect-params', type=str, dest='detect_params', nargs='*',
+                    default=[], help='PARAM=VALUE pairs of parameters for '
+                    'feature detector as allowed by OpenCV or AstroCV')
+parser.add_argument('--detect-max', type=int, dest='detect_max',
+                    default=None, help='Maximum number of detected features to '
+                    'display (in comment or by markers). Features with top response '
+                    'are selected')
+parser.add_argument('--detect-marker', type=str, dest='detect_marker',
+                    default=None, choices=['dot', 'ellipse', 'rect', 'cross', 'plus'],
+                    help='Type of marker for detected features')
+parser.add_argument('--track', type=str, dest='track',
+                    default=None, choices=['hungalman'],
+                    help='Object tracker type')
+parser.add_argument('--track-params', type=str, dest='track_params', nargs='*',
+                    default=[], help='PARAM=VALUE pairs of parameters for '
+                    'object tracker')
+parser.add_argument('--track-min-trace', type=int, dest='track_min_trace', default=3,
+                    help='Minimum trace length for detecting (default %(default)s)')
+
+parser.add_argument('--draw-frames', dest='draw_frames', action='store_true',
+                    default=False, help='Draw frames (OpenCV needed)')
+parser.add_argument('--min-redraw-delay', type=float, dest='min_redraw_delay',
+                    default=0.04, help='Minimum delay between redraws in seconds '
+                    '(default %(default)s)')
+parser.add_argument('-o', '--output-frames', type=str, dest='output_frames',
+                    default=None, help='Destination for output each frame, path to file '
+                    'with macroses as for --comment parameter, e.g. ./out/{n_frame}.bmp, '
+                    'specify ".bmp"/".tif"/".raw" or like to use stdout')
+parser.add_argument('--output-stream', type=str, dest='output_stream',
+                    default=None, help='Destination file for output video using certain codec '
+                    'with macroses as for --comment parameter, e.g. ./process.avi')
+parser.add_argument('--jpeg-quality', type=int, dest='jpeg_quality',
+                    default=80, help='JPEG quality for output frames in *.jpg format')
+parser.add_argument('--stream-codec', type=str, dest='stream_codec',
+                    default='XVID', help='FOURCC codec name to use in output stream '
+                    '(default %(default)s)')
+parser.add_argument('--stream-fps', type=float, dest='stream_fps',
+                    default=30, help='FPS to use in output stream video '
+                    '(default %(default).1f)')
+parser.add_argument('--output-comment-file', type=str, dest='output_comment_file',
+                    default=None, help='Destination for output each frame description, '
+                    'path to file with macroses as for --comment parameter.')
+parser.add_argument('--output-comment', type=str, dest='output_comment', nargs='*',
+                    default=[], help='Line(s) to put on separate file specified '
+                    'in --output-comment-file option. Available macroses are '
+                    'the same as for --comment parameter.')
+parser.add_argument('--min-output-delay', type=float, dest='min_output_delay',
+                    default=0.0, help='Minimum delay between outputs in seconds '
+                    '(default %(default)s)')
+
+parser.add_argument('--count', type=int, dest='count',
+                    default=None, help='Frames to process')
+                    
+parser.add_argument('--threads', type=int, dest='threads', default=None,
+                    help='OMP threads to use (Default - maximum)')
+
+
+args = parser.parse_args()
+
+
+logging.root.setLevel(logging.DEBUG)
+logging.root.addHandler(logging.StreamHandler())
+
+
+bytes_pp, dtype = {
+    'gray': (1, np.uint8),
+    'gray16le': (2, np.uint16)
+}[args.pixel_format]
+bits_pp = bytes_pp * 8
+white_level = (1 << bits_pp) - 1
+#width, height = map(int, args.frame_size.split('x'))
+
+
+if args.threads is None:
+     nthreads = astrocv.set_threads_count(astrocv.max_threads_count())
+else:
+     nthreads = astrocv.set_threads_count(args.threads)
+logging.info("Use %d thread(s)", nthreads)
+
+try:
+    import cv2
+    import numpy as np
+    import astrocv.processing as processing
+
+
+    def camera_params():
+        return {
+            "processing": "+".join(args.processing),
+            "detect": args.detect
+        }
+
+    def frame_params(channels, n_frame, timestamp):
+        gmt = time.gmtime(timestamp)
+        usecs = int((timestamp - int(timestamp)) * 1e6)
+        datestr = time.strftime("%Y-%m-%d", gmt)
+        timestr = time.strftime("%H:%M:%S", gmt)
+        min_levels, max_levels, avg_levels, std_levels = [], [], [], []
+        for pixels in channels:
+            h, w = pixels.shape
+            width, height = w, h
+            min_levels.append(pixels.min())
+            max_levels.append(pixels.max())
+            avg_levels.append(pixels.mean())
+            std_levels.append(pixels.std())
+        format_l = lambda l: ", ".join(["{:.1f}".format(x) for x in l])
+        return {
+            "date": datestr,
+            "time": timestr,
+            "timestamp": timestamp,
+            "usecs": usecs,
+            "n_frame": n_frame,
+            "width": width,
+            "height": height,
+            "pixtype": args.pixel_format,
+            "min": format_l(min_levels),
+            "max": format_l(max_levels),
+            "avg": format_l(avg_levels),
+            "std": format_l(std_levels),
+        }
+    
+
+    processing_params = {}
+    for param in args.processing_params:
+        index = param.find('=')
+        if index < 0:
+            logging.error("Can't parse processing parameter %s", param)
+            continue
+        name, value = param[:index], float(param[index+1:])
+        processing_params[name] = value
+
+    prev_frame = None
+    class FrameProcessors:
+        @staticmethod
+        def smooth(colors):
+            for i in range(len(colors)):
+                colors[i] = processing.smooth(colors[i], processing_params["kernel"])
+            return colors
+        @staticmethod
+        def contrast(colors):
+            for i in range(len(colors)):
+                colors[i] = processing.contrast(colors[i], processing_params["kernel"],
+                    processing_params["kernel"]*2, mask=mask)
+            return colors
+        @staticmethod
+        def negative(colors):
+            for i in range(len(colors)):
+                colors[i] = processing.negative(colors[i])
+            return colors
+        @staticmethod
+        def equalize(colors):
+            for i in range(len(colors)):
+                colors[i] = processing.equalize(colors[i])
+            return colors
+        @staticmethod
+        def sub_blue(colors):
+            if len(colors) < 3:
+                logging.warning("Can't sub_blue for frame with %d channels", len(colors))
+                return colors
+            r, g, b = colors[:3]
+            return [processing.sub_channel(r, b)]
+        @staticmethod
+        def sub_bgd(colors):
+            scale = int(processing_params.get('kernel', 16))
+            for i in range(len(colors)):
+                bgd = processing.resample(colors[i], scale, scale)
+                colors[i] = processing.sub(colors[i], bgd)
+            return colors
+        @staticmethod
+        def grayscale(colors):
+            return [processing.grayscale(colors)]
+        @staticmethod
+        def blur(colors):
+            ksize = processing_params.get('kernel', 5)
+            for i in range(len(colors)):
+                colors[i] = processing.blur_cv2(colors[i], ksize)
+            return colors
+        @staticmethod
+        def locmax(colors):
+            ksize = processing_params.get('kernel', 5)
+            for i in range(len(colors)):
+                colors[i] = processing.locmax_cv2(colors[i], ksize)
+            return colors
+        @staticmethod
+        def difference(colors):
+            global prev_frame
+            if prev_frame is None:
+                ret = colors
+            else:
+                ret = []
+                for i in range(len(colors)):
+                    ret.append(abs(colors[i] - prev_frame[i]))
+            prev_frame = colors
+            return ret
+
+
+    def process(colors):
+        global n_summed, accum
+                
+        for proc_type in args.processing:
+            if hasattr(FrameProcessors, proc_type):
+                colors = getattr(FrameProcessors, proc_type)(colors)
+            else:
+                logging.error("Unknown processing algorithm: %s", proc_type)
+        
+        if len(colors) == 1:
+            im = colors[0]
+        elif len(colors) == 3:
+            r, g, b = colors
+            im = cv2.merge([b, g, r])
+        elif len(colors) == 4:
+            r, g, b, g2 = colors
+            im = cv2.merge([b, g, r])
+        else:
+            raise Exception("Unexpected number of colors: %d", len(colors))
+        
+        return im
+
+
+    if args.detect is not None:
+        icolon = args.detect.find(':')
+        if icolon < 0:
+            lib, algo = 'cv', args.detect
+        else:
+            lib, algo = args.detect[:icolon].lower(), args.detect[icolon+1:]
+        if lib == 'cv':
+            import cv2 as feature_detector_module
+            detector_with_source = False
+        elif lib == 'sv':
+            import astrocv as feature_detector_module
+            detector_with_source = True
+        else:
+            logging.error("Unknown module for feature detection: %s", lib)
+        detector = feature_detector_module.FeatureDetector_create(algo)
+        for param in args.detect_params:
+            index = param.find('=')
+            if index < 0:
+                logging.error("Can't parse detector parameter, must has NAME=VALUE format [%s]", param)
+                continue
+            name, value = param[:index], param[index+1:].lower()
+            if value == "true":
+                detector.setBool(name, True)
+            elif value == "false":
+                detector.setBool(name, False)
+            else:
+                try:
+                    value = int(value)
+                    detector.setInt(name, value)
+                except:
+                    try:
+                        value = float(value)
+                        detector.setDouble(name, value)
+                    except:
+                        try:
+                            detector.setString(name, value)
+                        except Exception as ex:
+                            logging.error("Can't set detection parameter <%s> to <%s>: %s",
+                                         name, value, ex)
+
+    
+    if args.track is not None:
+        tracker = astrocv.Tracker(0, 0)
+        settings = {}
+        for param in args.track_params:
+            index = param.find('=')
+            if index < 0:
+                logging.error("Can't parse tracker parameter, must has NAME=VALUE format [%s]", param)
+                continue
+            name, value = param[:index], param[index+1:].lower()
+            if value.lower() == "true":
+                settings[name] = True
+            elif value.lower() == "false":
+                settings[name] = False
+            else:
+                try:
+                    settings[name] = str(value)
+                    settings[name] = float(value)
+                    settings[name] = int(value)
+                except:
+                    pass
+        tracker.settings.update(settings)
+
+    
+    def autodetect_color(region):
+        cnt = 1
+        for d in region.shape:
+            cnt *= d
+        avg = region.sum() / float(max(1, cnt))
+        if avg > white_level//2:
+            color = 0
+        else:
+            color = white_level
+        return color
+
+
+    def track(objects):
+        tracker.Update(objects)
+        features = []
+        for obj in tracker.track:
+            if len(obj.m_trace) < args.track_min_trace:
+                continue
+            last = obj.m_trace[-1]
+            I = r = last.intens
+            d = 4.0 / np.pi * (max(1.0, last.area)**0.5)
+            x, y = last.point
+            vx, vy = last.vx, last.vy
+            features.append((I, x, y, vx, vy, d, r))
+        return features
+
+    
+    def draw_feautres(im, features, marker):
+        for (I, x, y, vx, vy, d, r) in features:
+            l, t, r, b = map(int, (x - d, y - d, x + d, y + d))
+            x, y = map(int, (x, y))
+            thick = 1
+            color = autodetect_color(im[t:b+1, l:r+1])
+            cv2.circle(im, (x, y), thick*2, color, thick)
+            if marker == 'dot':
+                pass
+            elif marker == 'ellipse':
+                cv2.ellipse(im, (((l+r)//2, (b+t)//2), (r-l, b-t), 0.0), color, thick)
+            elif marker == 'rect':
+                cv2.rectangle(im, (l, t), (r, b), color, thick)
+            elif marker == 'cross':
+                cv2.line(im, (l, t), (r, b), color, thick)
+                cv2.line(im, (l, b), (r, t), color, thick)
+            elif marker == 'plus':
+                cv2.line(im, (x, t), (x, b), color, thick)
+                cv2.line(im, (l, y), (r, y), color, thick)
+            if vx is not None and vy is not None:
+                cv2.line(im, (x, y), (x-vx, y-vy), color, thick)
+    
+    
+    def detect(im, colors):
+        if args.detect is None:
+            return []
+        if bits_pp != 8 and feature_detector_module == cv2:
+            tmp = np.array(im >> 8, dtype=np.uint8)
+        else:
+            tmp = im
+        if detector_with_source:
+            keypoints = detector.detect(tmp, colors[0], mask, integralMask)
+        else:
+            keypoints = detector.detect(tmp)
+        features = []
+        for_tracker = []
+        for k in keypoints:
+            x, y = k.pt
+            vx, vy = None, None
+            d = k.size
+            
+            l, t, r, b = map(int, (x - d, y - d, x + d, y + d))
+            area = (b - t + 1) * (r - l + 1)
+            I = float(im[t:b+1, l:r+1].sum()) / float(area)
+            I = int((I / white_level) * 1000.0)
+            
+            r = k.response
+            if r is None or r <= 0:
+                r = I
+            features.append((I, x, y, vx, vy, d, r))
+            for_tracker.append(astrocv.TrackerObject(x, y, r, area))
+        
+        if args.track is not None:
+            features = track(for_tracker)
+        features.sort(reverse=True)
+        if args.detect_max is not None:
+            features = features[:args.detect_max]
+        if args.detect_marker is not None:
+            draw_feautres(im, features, args.detect_marker)
+        
+        return features
+
+
+    def format_detected(features):
+        return ", ".join(["{:.0f} ({:.1f}, {:.1f})".format(r, x, y) 
+                          for (I, x, y, vx, vy, d, r) in features])
+    
+
+    def add_comments(im, params):
+        line_height = 15
+        height = line_height*len(args.comment)
+        if args.comment_position == 'top':
+            offset = 0
+        else:
+            offset = im.shape[0] - height
+        color = autodetect_color(im[offset:offset+height])
+        for i in range(len(args.comment)):
+            y = offset + line_height*(i+1)
+            cv2.putText(im, args.comment[i].format(**params), 
+                        (0, y), cv2.FONT_HERSHEY_PLAIN, 1, color)
+        return im
+
+
+    def extract_ext(path):
+        index = path.rfind('.')
+        if index < 0:
+            raise Exception("Can't define type of path name: {}".format(path))
+        return path[:index], path[index:]
+
+
+    def ensure_dir_exists(path):
+        dirpath = os.path.dirname(path)
+        if dirpath == '':
+            return
+        if not os.access(dirpath, os.F_OK):
+            os.makedirs(dirpath)
+    
+
+    def output_comment(params):
+        txt = "".join([(s + "\n").format(**params) for s in args.output_comment])
+        buf = txt.encode()
+        if args.output_comment_file == "":
+            sys.stdout.write(buf)
+        else:
+            fname = args.output_comment_file.format(**params)
+            name, _ = extract_ext(fname)
+            ensure_dir_exists(fname)
+            with open(fname, 'a') as fout:
+                fout.write(buf)
+
+
+    def output_frame(im, params):
+        fname = args.output_frames.format(**params)
+        name, ext = extract_ext(fname)
+        if ext == '.raw':
+            buf = im.tostring()
+        else:
+            ret, buf = cv2.imencode(ext, im, [
+                cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality,
+                cv2.IMWRITE_PNG_BILEVEL, bits_pp
+            ])
+            buf = bytearray(buf)
+        if name == "":
+            sys.stdout.write(buf)
+        else:
+            ensure_dir_exists(fname)
+            with open(fname, 'w') as fout:
+                fout.write(buf)
+    
+
+    def output_stream(im, params):
+        global video_writer
+        if video_writer is None:
+            fname = args.output_stream.format(**params)
+            ensure_dir_exists(fname)
+            codec = (args.stream_codec + '    ')[:4]
+            dims = im.shape
+            if len(dims) == 2:
+                h, w, colored = dims[0], dims[1], False
+            else:
+                h, w, colored = dims[0], dims[1], (dims[2] >= 3)
+            video_writer = cv2.VideoWriter(fname, cv2.cv.CV_FOURCC(*codec), 
+                args.stream_fps, (w, h), colored)
+        if im.dtype == np.uint16:
+            im = np.array(im >> 8, dtype=np.uint8)
+        video_writer.write(im)
+    
+
+    def draw_frame(im):
+        cv2.imshow('frame', im)
+        return (cv2.waitKey(1) & 0xFF) in [ord('q'), 27]
+
+
+    last_draw = 0.0
+    last_output = 0.0
+    
+    last_fps_update = -10.0
+    last_n_frame = 0
+    n_frame = 0
+    params = None
+    video_writer = None
+    
+
+    def handle_frame(colors):
+        global n_frame, params
+        global last_draw, last_output, last_fps_update, last_n_frame
+        n_frame += 1
+        t = time.time()
+        time_to_draw = args.draw_frames and (t - last_draw >= args.min_redraw_delay)
+        time_to_output = (args.output_frames is not None or 
+                          args.output_stream is not None or
+                          args.output_comment_file is not None) and \
+                         (t - last_output >= args.min_output_delay)
+        
+        if params is None:
+            params = camera_params()
+        params.update(frame_params(colors, n_frame, t))
+        
+        if t - last_fps_update > 1.0:
+            fps = (n_frame - last_n_frame) / float(t - last_fps_update)
+            last_n_frame = n_frame
+            last_fps_update = t
+            params.update({
+                "fps": fps
+            })
+
+        im = process(colors)
+        detected = detect(im, colors)
+        params.update({
+            "detected": detected,
+            "sdetected": format_detected(detected)
+        })
+
+        im = add_comments(im, params)
+        if time_to_output:
+            last_output = t
+            if args.output_comment_file is not None:
+                output_comment(params)
+            if args.output_frames is not None:
+                output_frame(im, params)
+            if args.output_stream is not None:
+                output_stream(im, params)
+        if time_to_draw:
+            last_draw = t
+            stop = draw_frame(im)
+        else:
+            stop = False
+        
+        return stop
+
+
+except Exception as ex:
+    logging.error("Can't use OpenCV and/or numpy, "
+                 "drawing and outputting frames are not available")
+    raise
+
+
+class RawBinaryCap(object):
+    def __init__(self, fobj, pixel_format, video_size):
+        self.fobj = fobj
+        self.bpp, self.converter = {
+            'gray': (1, self._conv_gray), 
+            'gray16le': (2, self._conv_gray16le), 
+            'rgba' : (3, self._conv_rgba), 
+            'rgb0': (4, self._conv_rgb0)
+        }[pixel_format]
+        self.w, self.h = map(int, video_size.split('x'))
+        self.frame_size = self.bpp * self.w * self.h
+        
+    def read(self):
+        try:
+            pixels = self.fobj.read(self.frame_size)
+            return True, self.converter(pixels, self.h, self.w)
+        except:
+            return False, None
+    
+    @staticmethod
+    def _conv_gray(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint8), (h, w))
+    @staticmethod
+    def _conv_gray16le(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint16), (h, w))
+    @staticmethod
+    def _conv_rgba(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint8), (h, w, 4))
+    @staticmethod
+    def _conv_rgb0(buf, h, w):
+        return np.reshape(np.frombuffer(buf, dtype=np.uint8), (h, w, 3))
+
+
+if args.mask is not None and args.int_mask is not None:
+    maskIn = open(args.mask, 'rb')
+    maskCap = RawBinaryCap(maskIn, args.pixel_format, args.frame_size)
+
+    ret, frame = maskCap.read()
+    if not ret:
+        mask = integralMask = None
+    else:
+        mask = frame
+        integralMask = processing.integralFrom(mask)
+else:
+    mask = integralMask = None
+
+
+
+if args.pixel_format is not None and args.frame_size is not None:
+    if args.input == '-':
+        cap = RawBinaryCap(sys.stdin, args.pixel_format, args.frame_size)
+    else:
+        fin = open(args.input, 'rb')
+        cap = RawBinaryCap(fin, args.pixel_format, args.frame_size)
+else:
+    try:
+        src = int(args.input)
+    except:
+        src = args.input
+    cap = cv2.VideoCapture(src)
+    print("stream initialized as {} cv2 resource name".format(src))
+
+
+clock_0 = time.clock()
+t1 = time.time()
+last_update, last_frames = 0.0, 0
+try:
+    n_frame = 0
+    while args.count is None or n_frame < args.count:
+        now = time.time()
+        
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame.ndim == 3:
+            colors = [frame[:,:,i] for i in range(frame.shape[-1])]
+        else:
+            colors = [frame]
+        if handle_frame(colors):
+            break
+        
+        if now - last_update > 1.0:
+            fps = (n_frame - last_frames) / (now - last_update)
+            msg = "\r[{duration:.1f}] frames: {frames}; FPS: {fps:.2f}   ".format(
+                duration=time.time() - t1,
+                frames=n_frame,
+                fps=params.get("fps", 0)
+            )
+            sys.stderr.write(msg)
+            sys.stderr.flush()
+            last_update, last_frames = now, n_frame
+        
+        elapsed = time.time() - now
+        rest = args.delay - elapsed
+        if rest > 0:
+            time.sleep(rest)
+except KeyboardInterrupt:
+    print("Interrupted by user")
+except Exception as ex:
+    logging.error("Exception: %s", ex)
+    logging.error(traceback.format_exc())
+
+t2 = time.time()
+duration = t2 - t1
+
+if args.draw_frames:
+    try:
+        cv2.destroyAllWindows()
+    except:
+        pass
+
+print("\n")
+print("Duration: {:.3f}".format(duration))
+print("CPU Time: {:.3f}".format(time.clock() - clock_0))

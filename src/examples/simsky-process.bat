@@ -1,0 +1,2 @@
+C:\Python27\python.exe C:\Python27\Scripts\astrocv-simsky -s 512x512 --threads 1 -l 100 -o video.raw
+C:\Python27\python.exe C:\Python27\Scripts\astrocv-process -s 512x512 --threads 1 --detect sv:CONTRAST --detect-params minCertainty=3.0 maxSize=10 nMaxObjects=6 --detect-marker ellipse --track hungalman --track-params m_maxSkippedFrames=3 --track-min-trace 10 --draw-frames -i video.raw --delay 0.04
