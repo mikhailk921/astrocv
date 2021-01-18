@@ -1,191 +1,59 @@
 #include "astrocv.h"
 
-static void add_8b(uchar *firstImg, uchar *secondImg, uchar *outImg, int width, int height, int strideA, int strideB, int strideC, int koef)
-{
-	const int white_level = (1 << 8) - 1;
+/*add: out_img(C)=first_img(A) + second_img(B)*/
+template<typename T>
+static void add(T* first_img, T* sec_img, T* out_img,
+                const int width, const int height,
+                const int strideA, const int strideB, const int strideC,
+                const int koef, const int bpp) {
+	const auto white_level = (1 << bpp) - 1;
 	int i;
-#if  USE_OMP == 1
+#ifdef  USE_OMP
 #pragma omp parallel for private(i)
 #endif //  USE_OMP
-	for (i = 0; i < height; i++)
-	{
-		const uchar *pA = (const uchar*)((char*)firstImg + i * strideA);
-		const uchar *pB = (const uchar*)((char*)secondImg + i * strideB);
-		uchar *pC = (uchar*)((char*)outImg + i * strideC);
-		int j;
-		for (j = 0; j < width; j++)
-		{
-			int val = (int)(*pA++) + koef * (int)(*pB++);
-			(*pC++) = SATURATE(val, white_level);
-		}
-	}
-}
+	for (i = 0; i < height; i++) {
+		T pA = first_img + i * strideA;
+		T pB = sec_img + i * strideB;
+		T pC = out_img + i * strideC;
 
-
-static void add_16b(uchar *firstImg, uchar *secondImg, uchar *outImg, int width, int height, int strideA, int strideB, int strideC, int koef)
-{
-	const int white_level = (1 << 16) - 1;
-	int i;
-#if  USE_OMP == 1
-#pragma omp parallel for private(i)
-#endif //  USE_OMP
-	for (i = 0; i < height; i++)
-	{
-		const ushort *pA = (const ushort*)((char*)firstImg + i * strideA);
-		const ushort *pB = (const ushort*)((char*)secondImg + i * strideB);
-		ushort *pC = (ushort*)((char*)outImg + i * strideC);
-		int j;
-		for (j = 0; j < width; j++)
-		{
-			int val = (int)(*pA++) + koef * (int)(*pB++);
-			(*pC++) = SATURATE(val, white_level);
-		}
-	}
-}
-
-
-static void add_32b(uchar *firstImg, uchar *secondImg, uchar *outImg, int width, int height, int strideA, int strideB, int strideC, int koef)
-{
-	const uint white_level = (uint)((1LL << 32) - 1);
-	int i;
-#if  USE_OMP == 1
-#pragma omp parallel for private(i)
-#endif //  USE_OMP
-	for (i = 0; i < height; i++)
-	{
-		const uint *pA = (const uint*)((char*)firstImg + i * strideA);
-		const uint *pB = (const uint*)((char*)secondImg + i * strideB);
-		uint *pC = (uint*)((char*)outImg + i*strideC);
-		int j;
-		for (j = 0; j < width; j++)
-		{
+		for (auto j = 0; j < width; j++) {
 			uint val = (int)(*pA++) + koef * (int)(*pB++);
 			(*pC++) = SATURATE(val, white_level);
 		}
 	}
 }
 
-
-/*add: out_img(C)=first_img(A) + second_img(B)*/
-int add(uchar *firstImg, uchar *secondImg, int width, int height, int strideFir, int strideSec, uchar *outImg, int strideOut, int koef, int bpp)
-{
-	switch (bpp)
-	{
-	case 8:
-		add_8b(firstImg, secondImg, outImg, width, height, strideFir, strideSec, strideOut, koef);
-		return 0;
-	case 16:
-		add_16b(firstImg, secondImg, outImg, width, height, strideFir, strideSec, strideOut, koef);
-		return 0;
-	case 32:
-		add_32b(firstImg, secondImg, outImg, width, height, strideFir, strideSec, strideOut, koef);
-		return 0;
-	default:
-		return -1;
-	}
-}
-
-static void mult_8b(uchar *img, int width, int height, int stride, uchar *mask)
-{
-	const int white_level = (1 << 8) - 1;
+/*mult: first_img(C)=img(A) * mask(B)*/
+template<typename T>
+static void mult(const T* img, const int width, const int height, const int stride,
+                 const T* mask, const int bpp) {
+	const auto white_level = (1 << bpp) - 1;
 	int i;
-#if  USE_OMP == 1
+#ifdef  USE_OMP
 #pragma omp parallel for private(i)
 #endif //  USE_OMP
-	for (i = 0; i < height; i++)
-	{
-		uchar *pA = img + i * stride;
-		uchar *pB = mask + i * width;
-		//uchar *pC = (uchar*)((char*)img + i*stride);
-		int j;
-		for (j = 0; j < width; j++)
-		{
+	for (i = 0; i < height; i++) {
+		T* pA = img + i * stride;
+		T* pB = mask + i * width;
+		for (auto j = 0; j < width; j++) {
 			int val = (int)(*pA) * (int)(*pB++);
 			(*pA++) = SATURATE(val, white_level);
 		}
 	}
 }
 
-static void mult_16b(uchar *img, int width, int height, int stride, uchar *mask)
-{
-	const int white_level = (1 << 16) - 1;
-	int i;
-#if  USE_OMP == 1
-#pragma omp parallel for private(i)
-#endif //  USE_OMP
-	for (i = 0; i < height; i++)
-	{
-		const ushort *pA = (const ushort*)((char*)img + i * stride);
-		const uchar *pB = (const uchar*)((char*)mask + i * width);
-		ushort *pC = (ushort*)((char*)img + i*stride);
-		int j;
-		for (j = 0; j < width; j++)
-		{
-			int val = (int)(*pA++) * (int)(*pB++);
-			(*pC++) = SATURATE(val, white_level);
-		}
-	}
-}
-
-
-static void mult_32b(uchar *img, int width, int height, int stride, uchar *mask)
-{
-	const uint white_level = (uint)((1LL << 32) - 1);
-	int i;
-#if  USE_OMP == 1
-#pragma omp parallel for private(i)
-#endif //  USE_OMP
-	for (i = 0; i < height; i++)
-	{
-		const uint *pA = (const uint*)((char*)img + i * stride);
-		const uchar *pB = (const uchar*)((char*)mask + i * width);
-		uint *pC = (uint*)((char*)img + i * stride);
-		int j;
-		for (j = 0; j < width; j++)
-		{
-			uint val = (int)(*pA++) * (int)(*pB++);
-			(*pC++) = SATURATE(val, white_level);
-		}
-	}
-}
-
-/*mult: first_img(C)=img(A) * mask(B)*/
-int multOnMask(uchar *img, int width, int height, int stride, uchar *mask, int bpp)
-{
-	switch (bpp)
-	{
-	case 8:
-		mult_8b(img, width, height, stride, mask);
-		return 0;
-	case 16:
-		mult_16b(img, width, height, stride, mask);
-		return 0;
-	case 32:
-		mult_32b(img, width, height, stride, mask);
-		return 0;
-	default:
-		return -1;
-	}
-}
-
-
-
-static void smooth_8b(uint *integral, uchar *outImg, struct sSize size, int d)
-{
+template<typename T>
+static void smooth(T* integral, T* out_img, img_desc_t& size, int d) {
+	if (d < 2) d = 2;
 	int y;
-	if (d < 2)
-		d = 2;
 #if USE_OMP == 1
 #pragma omp parallel for private(y)
 #endif
-	for (y = 0; y < size.Height; y++)
-	{
-		uchar *dst = (uchar*)(outImg + y * size.Stride);
-		int x;
-		for (x = 0; x < size.Width; x++)
-		{
+	for (y = 0; y < size.Height; y++) {
+		T* dst = (T*)(out_img + y * size.stride);
+		for (auto x = 0; x < size.width; x++) {
 			double val = integralAvg(integral, size, x - d, y - d, x + d, y + d);
-			*(dst++) = (uchar)SATURATE(val, (double)0xff);
+			*(dst++) = (T)SATURATE(val, (double)0xff);
 		}
 	}
 }

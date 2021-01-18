@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
+
+project(astrocv)
+
+set(ASTROCV_MAIN_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(SOURCE_DIR ${ASTROCV_MAIN_SOURCE_DIR}/castrocv)

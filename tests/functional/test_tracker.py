@@ -38,11 +38,11 @@ try:
 
         cv2.setMouseCallback("Video", mv_mouseCallback)
         o = []
-        # o.append(TrackerObject(X, Y, 1000, 1000))
-        # o.append(TrackerObject(X+100, Y+100, 1000, 1000))
-        # o.append(TrackerObject(X+100, Y-100, 1000, 1000))
-        # o.append(TrackerObject(X-100, Y+100, 1000, 1000))
-        # o.append(TrackerObject(X-100, Y-100, 1000, 1000))
+        o.append(Tracker.TrackerObject(X, Y, 1000, 1000))
+        # o.append(Tracker.TrackerObject(X+100, Y+100, 1000, 1000))
+        # o.append(Tracker.TrackerObject(X+100, Y-100, 1000, 1000))
+        # o.append(Tracker.TrackerObject(X-100, Y+100, 1000, 1000))
+        # o.append(Tracker.TrackerObject(X-100, Y-100, 1000, 1000))
 
 
         shift = random.randint(0, MaxObjects - 1)

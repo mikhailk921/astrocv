@@ -6,9 +6,9 @@
 #include <time.h>
 
 #include <memory.h>
-//#include <ctype.h>
-//#include <omp.h>
-//#include <amp.h>
+// #include <ctype.h>
+// #include <omp.h>
+// #include <amp.h>
 
 #include <sys/types.h>
 #ifdef _WIN32
@@ -66,6 +66,12 @@ struct sSize
 {
 	int Width, Height;
 	int Stride;
+};
+
+struct img_desc_t
+{
+	int width, height;
+	int stride;
 };
 
 struct SAreaInfo
